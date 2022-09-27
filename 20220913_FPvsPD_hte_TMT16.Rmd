@@ -1,0 +1,987 @@
+---
+title: "20220913_FPvsPD_hte_TMT16"
+author: "Tianen He"
+date: "2022/9/13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(xlsx, VennDiagram, pheatmap, ggplot2, tidyr, ggsignif, limma,
+               clusterProfiler, org.Hs.eg.db, magrittr, stringr,
+               ggsci, ggthemes, ggVennDiagram, sva)
+
+colors = pal_jco()(10)
+hcolors = pal_simpsons()(16)
+
+pd1 = "#1e88e5"
+pd2 = "#bbdefb"
+
+fp1 = "#ffb300"
+fp2 = "#ffecb3"
+
+root = "D:/hetianen/Documents/Guomics/FPvsPD paper 2.0/PD3.0/"
+
+channel_num = 15 * 4
+
+sample_infos = read.xlsx("../cvdnx_kidney_label20210801_20211124edited.xlsx", sheetIndex = 1)
+```
+
+# input files
+
+variable pd, fp: quantified proteins without contaminants
+fp: input files are in log2 scale
+
+```{r}
+pd_unquant = read.csv("./TMT16_PD3/TMT16plex_chimerys_intensity_nocontam_220914_Proteins.txt", sep = "\t") 
+
+fp_contam = read.csv("./TMT16_FP18/tmt-report/ratio_protein_None.tsv", sep = "\t") # contain contaminants
+fp_abundance_contam = read.csv("./TMT16_FP18/tmt-report/abundance_protein_None.tsv", sep = "\t") # contain contaminants 
+
+contaminant_map = read.csv(paste0(root, "uniprot_contaminant_maps.txt"), sep = "\t")
+contaminant_entry = contaminant_map$Entry
+
+# batch-free data for limma are imported below
+```
+
+# process protein matrix
+
+```{r}
+# remove unquantified proteins
+tmp = pd_unquant[, c(96:110,112:126,128:142,144:158)-65]
+pd = pd_unquant[which(rowSums(is.na(tmp))!=dim(tmp)[2]), ]
+rm(tmp, pd_unquant)
+
+# remove contaminant
+fp = fp_contam[which(!(fp_contam$Index %in% contaminant_entry)),]
+fp_abundance_all = fp_abundance_contam[which(!(fp_abundance_contam$Index %in% contaminant_entry)),]
+rm(fp_contam, fp_abundance_contam)
+
+# sort by accession
+pd_sorted = pd[order(pd$Accession), ]
+fp_sorted = fp[order(fp$Index), ]
+fp_abundance_sorted = fp_abundance_all[order(fp_abundance_all$Index), ]
+
+# extract log2 abundances and linear ratios (60 channels)
+pd_abundance = pd_sorted[, c(96:110,112:126,128:142,144:158)-65] # abundance
+pd_abundance = log2(pd_abundance) # original output data are linear-scaled
+rownames(pd_abundance) = pd_sorted$Accession
+
+# calculate abundance ratio
+tmp_sample = pd_sorted[, c(96:110,112:126,128:142,144:158)-65]
+tmp_reference = pd_sorted[, rep(c(95,111,127,143), each = 15)-65]
+# tmp_sample[is.na(tmp_sample)] = 0
+tmp_reference[is.na(tmp_reference)] = 0
+tmp_ratio = tmp_sample/tmp_reference %>% data.frame()
+tmp_ratio[sapply(tmp_ratio,is.infinite)] = 100
+pd_ratio = tmp_ratio
+rm(tmp_ratio, tmp_sample, tmp_reference)
+rownames(pd_ratio) = pd_sorted$Accession
+
+# colnames(fp_sorted)
+fp_ratio = fp_sorted[, 6:65] # original output data are log2-scaled
+fp_ratio = 2^fp_ratio
+rownames(fp_ratio) = fp_sorted$Index
+
+# colnames(fp_abundance_sorted)
+fp_abundance = fp_abundance_sorted[, 6:65] # original output data are log2-scaled
+rownames(fp_abundance) = fp_sorted$Index
+
+rm(pd_sorted, fp_sorted)
+```
+
+## unify column names and orders
+
+```{r}
+# FP
+## rename columns
+samples = unlist(strsplit(colnames(fp_ratio), "X"))[seq(2, 120, 2)]
+samples = data.frame(V1 = unlist(strsplit(samples, "_[2-5]$")), 
+                     V2 = rep(c(2, 3, 4, 5), each = 15))
+samples = paste0("b", as.numeric(samples$V2) - 1, "_", samples$V1) # b2-b5 -> b1-b4
+colnames(fp_ratio) = samples
+colnames(fp_abundance) = colnames(fp_ratio)
+colnames(pd_ratio) = colnames(fp_ratio)
+colnames(pd_abundance) = colnames(fp_ratio)
+
+```
+
+```{r}
+# write.csv(pd_ratio, file = paste0(root, "PD_ratio_tmt16.csv"), quote = FALSE)
+# write.csv(pd_abundance, file = paste0(root, "PD_abundance[log2]_tmt16.csv"), quote = FALSE)
+
+# write.csv(fp_ratio, file = paste0(root, "FP_ratio_tmt16.csv"), quote = FALSE)
+# write.csv(fp_abundance, file = paste0(root, "FP_abundance[log2]_tmt16.csv"), quote = FALSE)
+```
+
+# sample grouping infos
+
+### technical replicates
+
+(old batch number)
+b5_133C b3_133N control cortex 
+b3_133C b2_129C covid medulla
+b2_133C b4_128N covid cortex
+
+```{r}
+reps = list()
+reps$group1 = c("b2_133N", "b4_133C")
+reps$group2 = c("b1_129C", "b2_133C")
+reps$group3 = c("b3_128N", "b1_133C")
+```
+
+```{r}
+# 53 channels (available in sample info table)
+sample_id = sample_infos$MS_Sample.ID %>% 
+    str_replace(., "b2", "b1") %>% 
+    str_replace(., "b3", "b2") %>% 
+    str_replace(., "b4", "b3") %>% 
+    str_replace(., "b5", "b4")
+sample_group = sample_infos$Group # COVID, Control
+sample_tissue = sample_infos$Tissue %>% 
+    gsub(pattern = " medulla", replacement = "Medulla") %>% 
+    gsub(pattern = " cortex", replacement = "Cortex") # Cortex, Medulla
+sample_infos$Tissue = sample_tissue
+sample_batch = substring(sample_id, first = 1, last = 2)
+
+# 60 channels
+groups = rep("Other", 60)
+groups[match(sample_id, samples)] = sample_group
+tissues = rep("Other", 60)
+tissues[match(sample_id, samples)] = sample_tissue
+# batches = rep(c("b2", "b3", "b4", "b5"), each = 15)
+batches = rep(c("b1", "b2", "b3", "b4"), each = 15)
+
+## replicates
+for (i in names(reps)) {
+    groups[match(reps[[i]][2], samples)] = groups[match(reps[[i]][1], samples)]
+    tissues[match(reps[[i]][2], samples)] = tissues[match(reps[[i]][1], samples)]
+}
+```
+
+## extract 53 labeled channels
+
+```{r}
+pd_abundance_labeled = pd_abundance[, match(sample_id, samples)]
+pd_ratio_labeled = pd_ratio[, match(sample_id, samples)]
+fp_abundance_labeled = fp_abundance[, match(sample_id, samples)]
+fp_ratio_labeled = fp_ratio[, match(sample_id, samples)]
+```
+
+# overlap of proteins quantified by two softwares
+
+```{r}
+pd_accession = pd$Accession
+fp_accession = fp$Index
+both_accession = sort(intersect(pd_accession, fp_accession))
+```
+
+```{r}
+venn = venn.diagram(list("PD" = pd_accession, "FP" = fp_accession), 
+             # paste0(root, "Figure2A_protein_overlap.svg"),
+             filename = NULL,
+             # imagetype = "svg",
+             height = 800, width = 800,
+             alpha = 0.6, lwd = 1, cex = 1,
+             cat.cex = 0.8, margin = 0.1, cat.dist = 0.07,
+             ext.text = TRUE,
+             ext.percent = c(0.2, 0.2, 0.2),
+             # fill = c("dodgerblue", "goldenrod1")
+             fill = c(pd1, fp1),
+             ext.length = 0.85
+             )
+
+ggsave(venn, path = root,
+       file = "Figure2A_protein_overlap.pdf", device = "pdf",
+       width = 600, height = 600, units = "px")
+```
+
+## comparison of abundance between overlapped and non-overlapped proteins (PD and FP merged)
+
+PD and FP merged to one plot
+
+```{r}
+# data1, data2: protein matrix, include only abundances/ratios
+# both_accession: accessions of overlapped proteins
+# ylabel: eg. abundance, intensity, log2 abundance
+compare_overlap_nonoverlap_merged = function (data1, data2, both_accession, 
+                                              device = "pdf", ylabel) {
+    
+    # preprocess data
+    num_channels = dim(data1)[2]
+    data1$software = rep("PD", dim(data1)[1])
+    data1$overlap = rep("unique", dim(data1)[1])
+    data1[which(rownames(data1) %in% both_accession), ]$overlap = "overlapping"
+    data1$overlap = as.factor(data1$overlap)
+    
+    data2$software = rep("FP", dim(data2)[1])
+    data2$overlap = rep("unique", dim(data2)[1])
+    data2[which(rownames(data2) %in% both_accession), ]$overlap = "overlapping"
+    data2$overlap = as.factor(data2$overlap)
+    
+    data = rbind(data1, data2)
+    data_longer = pivot_longer(data, cols = c(1:num_channels), names_to = "channel")
+    data_longer$facet = str_c(data_longer$software, data_longer$overlap, sep = " ")
+    data_longer$batch = data_longer$channel %>% 
+        str_extract(., pattern = "^b.+_") %>% 
+        # Perl regex: "." means any chars except \n, "+" means repeat 1 or more times
+        str_sub(., end = -2) %>% # remove "_"
+        as.factor()
+    num_batch = data_longer$batch %>% 
+        levels() %>% length()
+    
+    p_template_violin = ggplot(data_longer, aes(x=facet, y=value)) +
+        geom_violin(aes(fill=facet)) +
+        geom_signif(comparisons = list(c("PD overlapping", "PD unique"),
+                                       c("FP overlapping", "FP unique")),
+                    # y_position = 32,
+                    test = wilcox.test, textsize = 3, map_signif_level = TRUE) +
+        ylab(ylabel) + xlab("") +
+        theme_few() +
+        # scale_fill_simpsons() +
+        scale_fill_manual(values=c(fp1, fp2, pd1, pd2)) +
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+              legend.title = element_blank())
+    
+    # one violin plot for each batch
+    p_compare_batch_violin = p_template_violin +
+        facet_wrap(~batch, ncol = num_batch)
+    
+    # one violin plot for each channel
+    p_compare_channel_violin = p_template_violin +
+        facet_wrap(~channel, nrow = 5)
+    
+    return(list(p_compare_batch_violin, p_compare_channel_violin))
+}
+```
+
+```{r}
+violins = compare_overlap_nonoverlap_merged(
+    pd_abundance, fp_abundance, both_accession, ylabel = "Log2 (Protein abundance)")
+
+p_compare_batch_violin = violins[[1]]
+p_compare_channel_violin = violins[[2]]
+
+ggsave(file = paste0(root, "Figure2C_protein_overlap_compare_batch_violin.pdf"), 
+       plot = p_compare_batch_violin, width = 2400, height = 1000, units = "px")
+
+ggsave(file = paste0(root, "FigureS1_protein_overlap_compare_channel_violin.pdf"),
+       plot = p_compare_channel_violin, width = 3000, height = 3000, units = "px")      
+```
+
+# correlation coefficients
+
+## correlation of abundance ratios of each sample (53 channels)
+
+```{r}
+# normalize
+# pd_ratio_scaled = t(scale(t(pd_ratio_labeled)))
+# fp_ratio_scaled = t(scale(t(fp_ratio_labeled)))
+pd_ratio_scaled = pd_ratio_labeled
+fp_ratio_scaled = fp_ratio_labeled
+
+# proteins identified in common
+pd_ratio_both = pd_ratio_scaled[both_accession, ] %>% as.data.frame()
+fp_ratio_both = fp_ratio_scaled[both_accession, ] %>% as.data.frame()
+
+colnames(pd_ratio_both) = paste("PD", colnames(pd_ratio_both), sep = "_")
+colnames(fp_ratio_both) = paste("FP", colnames(fp_ratio_both), sep = "_")
+
+cor_matrix = cor(pd_ratio_both, fp_ratio_both, use = "pairwise.complete.obs",
+                 method = "spearman")
+# cor_pd = cor(pd_ratio_both, use = "pairwise.complete.obs") # for row clustering
+# cor_fp = cor(fp_ratio_both, use = "pairwise.complete.obs") # for column clustering
+```
+
+```{r}
+# anno_row = data.frame(Group = sample_group, Tissue = sample_tissue,
+#                       Batch = sample_batch, row.names = colnames(pd_ratio_both))
+# anno_col = data.frame(Group = sample_group, Tissue = sample_tissue,
+#                       Batch = sample_batch, row.names = colnames(fp_ratio_both))
+# 
+# anno_color = list(Batch = c(b1 = hcolors[1], b2 = hcolors[5], 
+#                             b3 = hcolors[4], b4 = hcolors[14]),
+#                   Tissue = c(Cortex = hcolors[9], Medulla = hcolors[6]),
+#                   Group = c(Control = hcolors[7], COVID = hcolors[10]))
+# 
+# pheatmap(cor_matrix, 
+#          cluster_cols = F, cluster_rows = F,
+#          # clustering_distance_rows = as.dist(1 - cor_pd),
+#          # clustering_distance_cols = as.dist(1 - cor_fp),
+#          filename = paste0(root, "protein_cor_matrix_53samples_tmt16.pdf"), 
+#          annotation_col = anno_col,
+#          annotation_row = anno_row,
+#          annotation_colors = anno_color,
+#          # main = "Pearson Correlation Matrix",
+#          color = cividis(100, direction = 1),
+#          width = 10, height = 9, fontsize = 8,
+#          # show_colnames = F, show_rownames = F,
+#          # fontsize_row = 6, fontsize_col = 6,
+#          # angle_col = "315"
+#          )
+```
+
+```{r}
+# extract diagonal
+cor_self = diag(cor_matrix)
+cor_self_median = median(cor_self)
+cor_self_median
+
+hist_plot = ggplot(data.frame(cor_self), aes(x = cor_self, y = ..count..)) +
+    geom_histogram(bins = 10, fill = colors[10], color = "white") +
+    # ggtitle("Distribution of Pearson Correlation Coefficient") + 
+    xlab("Spearman's correlation coefficient") +
+    ylab("Count of samples") +
+    # ylim(0, 20) +
+    theme_few() +
+    geom_vline(xintercept = cor_self_median, color = colors[2], size = 1, linetype = 1)
+ggsave(plot = hist_plot, file = paste0(
+    root, "FigureS2F_correlation_coefficient_distribution_53samples_tmt16.pdf"),
+       width = 1200, height = 1000, units = "px")
+hist_plot
+```
+
+## correlation of abundance ratios of each protein (53 channels)
+
+```{r}
+# transpose
+pd_ratio_t = t(pd_ratio_labeled) %>% as.data.frame() 
+fp_ratio_t = t(fp_ratio_labeled) %>% as.data.frame() 
+
+# extract proteins in common
+pd_ratio_both_t = pd_ratio_t[, sort(both_accession)] %>% as.data.frame()
+fp_ratio_both_t = fp_ratio_t[, sort(both_accession)] %>% as.data.frame()
+
+cor_self_t = list()
+for (prot in both_accession) {
+    cor_t = cor(pd_ratio_both_t[[prot]], fp_ratio_both_t[[prot]], 
+                method = "spearman", use = "pairwise.complete.obs")
+    cor_self_t[[prot]] = cor_t
+}
+cor_self_t = unlist(cor_self_t)
+
+summary(cor_self_t)
+cor_self_median_t = median(cor_self_t, na.rm = T)
+cor_self_median_t
+
+hist_plot_t = ggplot(data.frame(cor_self_t), aes(x = cor_self_t, y = ..count..)) +
+    geom_histogram(bins = 20, fill = colors[10], color = "white") +
+    # ggtitle("Distribution of Pearson Correlation Coefficient") + 
+    xlab("Spearman's correlation coefficient") +
+    ylab("Count of proteins") +
+    # ylim(0, 20) +
+    theme_few() +
+    geom_vline(xintercept = cor_self_median_t, color = colors[2], size = 1, linetype = 1)
+ggsave(plot = hist_plot_t, file = paste0(root, "Figure2D_correlation_coefficient_distribution_53samples_proteins_tmt16.pdf"),
+       width = 1200, height = 1000, units = "px")
+hist_plot_t
+```
+
+## correlation of protein matrix as a whole
+
+```{r}
+pd_ratio_both_vector = unlist(pd_ratio_both)
+fp_ratio_both_vector = unlist(fp_ratio_both)
+
+cor = cor(pd_ratio_both_vector, fp_ratio_both_vector, use = "pairwise.complete.obs",
+          method = "spearman")
+cor.test(pd_ratio_both_vector, fp_ratio_both_vector, use = "pairwise.complete.obs",
+         alternative = "two.sided", method = "spearman")
+```
+
+## correlation of technical replicates
+
+### PD
+
+```{r}
+pd_abundance_both_60 = pd_abundance
+
+pd_cor_reps = list()
+pd_cor_reps_test = list()
+for (i in names(reps)) {
+    quant_rep1 = pd_abundance_both_60[reps[[i]][1]] %>% unlist()
+    quant_rep2 = pd_abundance_both_60[reps[[i]][2]] %>% unlist()
+    pd_cor_reps[[i]] = cor(quant_rep1, quant_rep2, use = "pairwise.complete.obs",
+                           method = "spearman")
+    pd_cor_reps_test[[i]] = cor.test(quant_rep1, quant_rep2, 
+                                     alternative = "two.sided", 
+                                     method = "spearman")
+}
+pd_cor_reps
+pd_cor_reps_test
+```
+
+### FP
+
+```{r}
+fp_abundance_both_60 = fp_abundance
+
+fp_cor_reps = list()
+fp_cor_reps_test = list()
+for (i in names(reps)) {
+    quant_rep1 = fp_abundance_both_60[reps[[i]][1]] %>% unlist()
+    quant_rep2 = fp_abundance_both_60[reps[[i]][2]] %>% unlist()
+    fp_cor_reps[[i]] = cor(quant_rep1, quant_rep2, use = "pairwise.complete.obs",
+                           method = "spearman")
+    fp_cor_reps_test[[i]] = cor.test(quant_rep1, quant_rep2,
+                                     alternative = "two.sided",
+                                     method = "spearman")
+}
+fp_cor_reps
+fp_cor_reps_test
+```
+
+### t-test 
+
+```{r}
+t.test(unlist(fp_cor_reps), unlist(pd_cor_reps), alternative = "greater")
+```
+
+# ---------------------------------------------------
+
+# preprocess protein matrix for limma
+
+```{r}
+median_normalize = function (data) {
+    # check median centering
+    par(mfrow = c(1, 2))
+    boxplot(data, las = 2, main = "before")
+    
+    # median normalization by channel (make the median of each channel zero)
+    data_medians = apply(data, 2, median, na.rm = TRUE)
+    data_norm = as.data.frame(scale(data, center = data_medians, scale = FALSE))
+    
+    # check median centering
+    boxplot(data_norm, las = 2, main = "after")
+    
+    return(data_norm)
+}
+```
+
+## imputation, log2 transformation, normalization
+
+```{r}
+pd_limma = pd_ratio_labeled
+fp_limma = fp_ratio_labeled
+
+# 220919 added: replace zeros to avoid errors downstream
+pd_limma[pd_limma == 0] = NA
+fp_limma[fp_limma == 0] = NA
+
+# impute NAs with 0.8 of minimum
+pd_limma[is.na(pd_limma)] = 0.8*min(pd_limma, na.rm = T)
+fp_limma[is.na(fp_limma)] = 0.8*min(fp_limma, na.rm = T)
+
+# log2 transformation
+pd_limma = log2(pd_limma)
+fp_limma = log2(fp_limma)
+
+# median normalization
+pd_limma_norm = median_normalize(pd_limma)
+fp_limma_norm = median_normalize(fp_limma)
+```
+
+```{r}
+# save data for BatchServer
+# write.csv(pd_limma_norm, file = "./PD_ratio_53_limma_batch.csv", quote = FALSE)
+# write.csv(fp_limma_norm, file = "./FP_ratio_53_limma_batch.csv", quote = FALSE)
+```
+
+## (BatchServer) evaluate, remove, and evaluate again batch effect
+
+### alternative: ComBat
+
+```{r}
+# pd_limma_norm = read.csv(paste0(root, "PD_ratio_53_limma_batch.csv"), row.names = 1)
+# fp_limma_norm = read.csv(paste0(root, "FP_ratio_53_limma_batch.csv"), row.names = 1)
+
+mod = model.matrix(~as.factor(Group) +as.factor(Tissue), data = sample_infos)
+
+# pd_batchfree = ComBat(dat = pd_limma_norm, batch = sample_batch, par.prior = F, mod = mod)
+# fp_batchfree = ComBat(dat = fp_limma_norm, batch = sample_batch, par.prior = F, mod = mod)
+
+# write.csv(pd_batchfree, file = paste0(root, "PD_ratio_53_limma_batchfree_combat.csv"), quote = FALSE)
+# write.csv(fp_batchfree, file = paste0(root, "FP_ratio_53_limma_batchfree_combat.csv"), quote = FALSE)
+
+# pd_batchfree = read.csv(paste0(root, "PD_ratio_53_limma_batchfree_combat.csv"), row.names = 1)
+# fp_batchfree = read.csv(paste0(root, "FP_ratio_53_limma_batchfree_combat.csv"), row.names = 1)
+```
+
+## median normalize batch-free data
+
+```{r}
+# import data
+# pd_batchfree = read.csv(paste0(root, "PD_ratio_53_limma_batchfree.csv"), row.names = 1)
+# fp_batchfree = read.csv(paste0(root, "FP_ratio_53_limma_batchfree.csv"), row.names = 1)
+```
+
+```{r}
+# median normalization by channel
+pd_bf_norm = median_normalize(pd_batchfree)
+fp_bf_norm = median_normalize(fp_batchfree)
+```
+
+```{r}
+# save data for BatchServer
+# write.csv(pd_bf_norm, file = paste0(root, "PD_ratio_53_limma_batchfree_norm.csv"), quote = FALSE)
+# write.csv(fp_bf_norm, file = paste0(root, "FP_ratio_53_limma_batchfree_norm.csv"), quote = FALSE)
+```
+
+## (BatchServer) evaluate batch effect in batch-free data
+
+# DE analysis with limma
+
+## make design and contrasts
+
+```{r}
+# make design table
+limma_group = interaction(sample_group, sample_tissue)
+design = model.matrix(~0 + limma_group)
+colnames(design) = levels(limma_group)
+rownames(design) = sample_id
+
+# make contrasts
+x = c("COVID.Cortex-Control.Cortex", "COVID.Medulla-Control.Medulla")
+contrast = makeContrasts(contrasts=x, levels=design)
+```
+
+## DEP analysis and plotting
+
+```{r}
+# contrast_which: column number or column name specifying which contrast of the linear model is of interest
+# software, group: for output file naming, eg. PD, FP; cortex, medulla
+limma_DEP = function(data, design, contrast_all, contrast_which, software, group,
+                     p_thres = 0.05, lfc_thres = log2(1.5), # default parameter
+                     p_thres_label = 0.05, lfc_thres_label = log2(1.5),
+                     device = "pdf") {
+    # fit
+    fit1 = lmFit(data, design)
+    head(coef(fit1))
+    fit2 = contrasts.fit(fit1, contrasts = contrast_all)
+    fit3 = eBayes(fit2)
+    
+    # plotSA(fit3, main="Final model: Mean-variance trend")
+    
+    # filter (default: fc > 1.5, adj.p < 0.05)
+    dep_table = topTable(fit3, sort.by = "P", number = Inf, 
+                         coef = contrast_which, 
+                         p.value = p_thres, lfc = lfc_thres)
+    dep_table$protein = rownames(dep_table)
+    dep_table = dep_table[ , c("protein", colnames(dep_table)[1:6])]
+    
+    # map the UNIPROT id to gene symbol (remove duplicate)
+    tmp = bitr(dep_table$protein, OrgDb = org.Hs.eg.db, drop = FALSE,
+               fromType = "UNIPROT", toType = "SYMBOL")
+    dup = duplicated(tmp$UNIPROT)
+    
+    for (i in 1:length(dup)) {
+        j = length(dup) - i + 1 # from tail to head
+        if (dup[j] == TRUE) {
+            cat_symbol = paste0(tmp[j - 1, "SYMBOL"], ",", tmp[j, "SYMBOL"])
+            tmp[j - 1, "SYMBOL"] = cat_symbol
+        }
+    }
+    dep_table$symbol = tmp[which(!duplicated(tmp$UNIPROT)), "SYMBOL"]
+    rm(tmp, dup)
+    
+    # save table
+    write.table(dep_table, row.names = FALSE, sep = "\t", quote = FALSE,
+                file = paste0(root, "dep_", software, "_", group, ".tsv"))
+    
+    # volcano plot
+    dep_table_volcano = topTable(fit3, sort.by = "P", number = Inf, coef = contrast_which)
+    dep_table_volcano$protein = rownames(dep_table_volcano)
+    dep_table_volcano$threshold = ifelse(dep_table_volcano$adj.P.Val < p_thres & 
+                                             abs(dep_table_volcano$logFC) >= lfc_thres,
+                                         ifelse(dep_table_volcano$logFC >= lfc_thres, 
+                                                'up', 'down'), 
+                                         '-') %>% as.factor()
+    
+    # map the UNIPROT id to gene symbol (remove duplicate)
+    tmp = bitr(dep_table_volcano$protein, OrgDb = org.Hs.eg.db, drop = FALSE,
+               fromType = "UNIPROT", toType = "SYMBOL")
+    dup = duplicated(tmp$UNIPROT)
+    
+    for (i in 1:length(dup)) {
+        j = length(dup) - i + 1 # from tail to head
+        if (dup[j] == TRUE) {
+            cat_symbol = paste0(tmp[j - 1, "SYMBOL"], ",", tmp[j, "SYMBOL"])
+            tmp[j - 1, "SYMBOL"] = cat_symbol
+        }
+    }
+    dep_table_volcano$symbol = tmp[which(!duplicated(tmp$UNIPROT)), "SYMBOL"]
+    rm(tmp, dup)
+    
+    # label specific points with SYMBOL
+    dep_table_volcano$label = ifelse(dep_table_volcano$adj.P.Val < p_thres_label & 
+                                     abs(dep_table_volcano$logFC) >= lfc_thres_label,
+                                         dep_table_volcano$symbol, "")
+    
+    ## save table
+    write.table(dep_table_volcano, row.names = FALSE, sep = "\t", quote = FALSE,
+                file = paste0(root, "volcano_", software, "_", group, ".tsv"))
+    
+}
+```
+
+```{r}
+lfc_thres = log2(1.5)
+# PD
+# voom(pd_bf_norm, design, plot = T)
+limma_DEP(pd_bf_norm, design, contrast, contrast_which = 1,
+          lfc_thres = lfc_thres, p_thres_label = 0, 
+          device = "pdf", 
+          software = "PD", group = "cortex")
+limma_DEP(pd_bf_norm, design, contrast, contrast_which = 2,
+          lfc_thres = lfc_thres, p_thres_label = 0,
+          device = "pdf",
+          software = "PD", group = "medulla")
+
+# FP
+limma_DEP(fp_bf_norm, design, contrast, contrast_which = 1,
+          lfc_thres = lfc_thres, p_thres_label = 0,
+          device = "pdf",
+          software = "FP", group = "cortex")
+limma_DEP(fp_bf_norm, design, contrast, contrast_which = 2,
+          lfc_thres = lfc_thres, p_thres_label = 0,
+          device = "pdf",
+          software = "FP", group = "medulla")
+```
+
+## overlap of DEPs
+
+```{r}
+# import dep tables
+dep_tables = list()
+dep_tables$pd_cortex = read.table("dep_PD_cortex.tsv", header = T, sep = "\t")
+dep_tables$pd_medulla = read.table("dep_PD_medulla.tsv", header = T, sep = "\t")
+dep_tables$fp_cortex = read.table("dep_FP_cortex.tsv", header = T, sep = "\t")
+dep_tables$fp_medulla = read.table("dep_FP_medulla.tsv", header = T, sep = "\t")
+
+# DEP entries
+dep_ids = list()
+dep_ids$cortex$pd_up = dep_tables$pd_cortex %>% filter(logFC > 0) %>% extract2("protein")
+dep_ids$cortex$pd_down = dep_tables$pd_cortex %>% filter(logFC < 0) %>% extract2("protein")
+dep_ids$cortex$fp_up = dep_tables$fp_cortex %>% filter(logFC > 0) %>% extract2("protein")
+dep_ids$cortex$fp_down = dep_tables$fp_cortex %>% filter(logFC < 0) %>% extract2("protein")
+
+dep_ids$medulla$pd_up = dep_tables$pd_medulla %>% filter(logFC > 0) %>% extract2("protein")
+dep_ids$medulla$pd_down = dep_tables$pd_medulla %>% filter(logFC < 0) %>% extract2("protein")
+dep_ids$medulla$fp_up = dep_tables$fp_medulla %>% filter(logFC > 0) %>% extract2("protein")
+dep_ids$medulla$fp_down = dep_tables$fp_medulla %>% filter(logFC < 0) %>% extract2("protein")
+```
+
+### venn diagrams
+
+```{r}
+# cortex
+dep_cortex_venn = venn.diagram(list("PD up" = dep_ids$cortex$pd_up,
+                  "PD down" = dep_ids$cortex$pd_down,
+                  "FP up" = dep_ids$cortex$fp_up,
+                  "FP down" = dep_ids$cortex$fp_down),
+             # paste0(root, "dep_overlap_cortex.tiff"),
+             filename = NULL,
+             alpha = 0.6,
+             height = 1200, width = 1400, cex = 1, cat.cex = 0.8,
+             margin = 0.1,
+             # cat.pos = c(200, 160),
+             fill = c(pd1, pd2, fp1, fp2),
+             main = "DEP cortex")
+ggsave(dep_cortex_venn,
+       path = root, filename = "Figure4A_dep_overlap_cortex.pdf", device = "pdf",
+       width = 700, height = 700, units = "px")
+
+# medulla
+dep_medulla_venn = venn.diagram(list("PD up" = dep_ids$medulla$pd_up,
+                  "PD down" = dep_ids$medulla$pd_down,
+                  "FP up" = dep_ids$medulla$fp_up,
+                  "FP down" = dep_ids$medulla$fp_down),
+             # paste0(root, "dep_overlap_medulla.tiff"),
+             filename = NULL,
+             alpha = 0.6,
+             height = 1200, width = 1400, cex = 1, cat.cex = 0.8,
+             # cat.pos = c(200, 160),
+             # fill = c("dodgerblue", "goldenrod1"),
+             margin = 0.1,
+             # fill = hcolors[c(1, 2, 5, 10)],
+             fill = c(pd1, pd2, fp1, fp2),
+             main = "DEP medulla")
+ggsave(dep_medulla_venn,
+       path = root, filename = "Figure4A_dep_overlap_medulla.pdf", device = "pdf",
+       width = 700, height = 700, units = "px")
+```
+
+## enrichment analysis of DEPs
+
+```{r}
+enrich_analysis = function(dep_table, p_thres = 0.05, software, group) {
+    # make a sorted gene list with uniprot id and FC
+    dep_table_fc = 2^dep_table[, "logFC"]
+    names(dep_table_fc) = as.character(dep_table[["protein"]])
+    dep_table_fc = sort(dep_table_fc, decreasing = TRUE)
+    
+    # GO MF
+    gomf = enrichGO(dep_table[["protein"]], OrgDb = org.Hs.eg.db,
+                  ont = "MF", keyType = "UNIPROT", pvalueCutoff = p_thres)
+    # write.table(gomf, file = paste0("go_mf_dep_", software, "_", group, ".tsv"),
+    #             quote = FALSE, sep = "\t", row.names = FALSE)
+    
+    # GO BP
+    gobp = enrichGO(dep_table[["protein"]], OrgDb = org.Hs.eg.db,
+                  ont = "BP", keyType = "UNIPROT", pvalueCutoff = p_thres)
+    # write.table(gobp, file = paste0("go_bp_dep_", software, "_", group, ".tsv"),
+    #             quote = FALSE, sep = "\t", row.names = FALSE)
+    
+    # GO CC
+    gocc = enrichGO(dep_table[["protein"]], OrgDb = org.Hs.eg.db,
+                  ont = "CC", keyType = "UNIPROT", pvalueCutoff = p_thres)
+    # write.table(gocc, file = paste0("go_cc_dep_", software, "_", group, ".tsv"),
+    #             quote = FALSE, sep = "\t", row.names = FALSE)
+    
+    # KEGG
+    kegg = enrichKEGG(dep_table[["protein"]], organism = 'hsa',
+                      keyType = "uniprot", pvalueCutoff = p_thres)
+    # write.table(kegg, file = paste0("kegg_dep_", software, "_", group, ".tsv"),
+    #             quote = FALSE, sep = "\t", row.names = FALSE)
+    
+    return(list(gomf, gobp, gocc, kegg))
+}
+```
+
+```{r}
+go_result_list = list()
+kegg_result_list = list()
+
+go_id_list = list()
+kegg_id_list = list()
+
+for (software in c("PD", "FP")) {
+    for (group in c("cortex", "medulla")) {
+        acronym = ifelse(software == "FP", "fp", "pd")
+        name = paste0(acronym, "_", group)
+        table = dep_tables[[name]]
+        
+        return = enrich_analysis(table, software = software, group = group)
+        
+        go_result_list[[name]] = list()
+        go_result_list[[name]][["MF"]] = return[[1]]
+        go_result_list[[name]][["BP"]] = return[[2]]
+        go_result_list[[name]][["CC"]] = return[[3]]
+        kegg_result_list[[name]] = return[[4]]
+        
+        go_id_list[[name]] = list()
+        go_id_list[[name]][["MF"]] = return[[1]]$ID
+        go_id_list[[name]][["BP"]] = return[[2]]$ID
+        go_id_list[[name]][["CC"]] = return[[3]]$ID
+        kegg_id_list[[name]] = return[[4]]$ID
+    }
+}
+```
+
+```{r}
+# save(go_result_list, kegg_result_list, go_id_list, kegg_id_list,
+#      file = paste0(root, "go_kegg_results.RData"))
+load(paste0(root, "go_kegg_results.RData"))
+```
+
+### overlap of enriched terms (venn)
+
+```{r}
+# cortex
+for (type in c("BP", "MF", "CC")) {
+    
+    go_cortex_venn = venn.diagram(list("PD" = go_id_list$pd_cortex[[type]],
+                                   "FP" = go_id_list$fp_cortex[[type]]),
+             # paste0(root, "GO_overlap_cortex.tiff"),
+             filename = NULL,
+             height = 800, width = 800,
+             alpha = 0.6, cex = 1, cat.cex = 0.8,
+             main.cex = 0.8,
+             margin = 0.2, cat.dist = 0.07,
+             # cat.pos = c(320, 40),
+             fill = c(pd1, fp1),
+             main = paste0("Enriched GO ", type, "s in the cortex"))
+    ggsave(go_cortex_venn,
+           path = root,
+           filename = paste0("Figure4C-S3A_GO_", type, "_overlap_cortex.pdf"), 
+           units = "px", width = 600, height = 600)
+}
+
+kegg_cortex_venn = venn.diagram(list("PD" = kegg_id_list$pd_cortex,
+                  "FP" = kegg_id_list$fp_cortex),
+             # paste0(root, "KEGG_overlap_cortex.tiff"),
+             filename = NULL,
+             height = 800, width = 800,
+             alpha = 0.6, cex = 1, cat.cex = 0.8,
+             main.cex = 0.8,
+             margin = 0.2, cat.dist = 0.07,
+             # cat.pos = c(320, 40),
+             fill = c(pd1, fp1),
+             main = "Enriched KEGG pathways in the cortex")
+ggsave(kegg_cortex_venn,
+       path = root,
+       filename = "Figure4C_KEGG_overlap_cortex.pdf", units = "px",
+       width = 600, height = 600)
+
+# medulla
+for (type in c("BP", "MF", "CC")) {
+    
+    go_medulla_venn = venn.diagram(list("PD" = go_id_list$pd_medulla[[type]],
+                                   "FP" = go_id_list$fp_medulla[[type]]),
+             # paste0(root, "GO_overlap_cortex.tiff"),
+             filename = NULL,
+             height = 800, width = 800,
+             alpha = 0.6, cex = 1, cat.cex = 0.8,
+             main.cex = 0.8,
+             margin = 0.2, cat.dist = 0.07,
+             # cat.pos = c(320, 40),
+             fill = c(pd1, fp1),
+             main = paste0("Enriched GO ", type, "s in the medulla"))
+    ggsave(go_medulla_venn,
+           path = root,
+           filename = paste0("FigureS3C_GO_", type, "_overlap_medulla.pdf"), 
+           units = "px", width = 600, height = 600)
+}
+
+kegg_medulla_venn = venn.diagram(list("PD" = kegg_id_list$pd_medulla,
+                  "FP" = kegg_id_list$fp_medulla),
+             # paste0(root, "KEGG_overlap_cortex.tiff"),
+             filename = NULL,
+             height = 800, width = 800,
+             alpha = 0.6, cex = 1, cat.cex = 0.8,
+             main.cex = 0.8,
+             margin = 0.2, cat.dist = 0.07,
+             # cat.pos = c(320, 40),
+             fill = c(pd1, fp1),
+             main = "Enriched KEGG pathways in the medulla")
+ggsave(kegg_medulla_venn,
+       path = root,
+       filename = "FigureS3C_KEGG_overlap_medulla.pdf", units = "px",
+       width = 600, height = 600)
+```
+
+### draw comparison plots
+
+```{r}
+p_thres = 0.05
+
+# cortex
+dep_ids_cortex = list()
+dep_ids_cortex$PD = c(dep_ids$cortex$pd_up, dep_ids$cortex$pd_down)
+dep_ids_cortex$FP = c(dep_ids$cortex$fp_up, dep_ids$cortex$fp_down)
+
+## go bp
+compare_gobp_cortex = compareCluster(geneClusters = dep_ids_cortex, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "BP", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gobp_cortex, showCategory = 10) +
+    ggtitle("Top enriched biological processes in the cortex") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "Figure4D_compare_gobp_cortex.pdf", units = "px",
+       width = 1600, height = 1400)
+
+## go mf (supplementary)
+compare_gomf_cortex = compareCluster(geneClusters = dep_ids_cortex, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "MF", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gomf_cortex, showCategory = 10) +
+    ggtitle("Top enriched GO MFs in the cortex") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 45))
+ggsave(filename = "FigureS3B_compare_gomf_cortex.pdf", units = "px",
+       width = 1500, height = 1800)
+
+## go cc (supplementary)
+compare_gocc_cortex = compareCluster(geneClusters = dep_ids_cortex, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "CC", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gocc_cortex, showCategory = 10) +
+    ggtitle("Top enriched GO CCs in the cortex") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "FigureS3B_compare_gocc_cortex.pdf", units = "px",
+       width = 1500, height = 1800)
+
+## kegg
+compare_kegg_cortex = compareCluster(geneClusters = dep_ids_cortex, fun = enrichKEGG,
+                                     organism = 'hsa',
+                                     keyType = "uniprot", pvalueCutoff = p_thres)
+dotplot(compare_kegg_cortex, showCategory = 10) +
+    ggtitle("Top enriched KEGG pathways in the cortex") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "Figure4D_compare_kegg_cortex.pdf", units = "px",
+       width = 1600, height = 1400)
+```
+
+
+```{r}
+# medulla
+dep_ids_medulla = list()
+dep_ids_medulla$PD = c(dep_ids$medulla$pd_up, dep_ids$medulla$pd_down)
+dep_ids_medulla$FP = c(dep_ids$medulla$fp_up, dep_ids$medulla$fp_down)
+
+
+## go bp
+compare_gobp_medulla = compareCluster(geneClusters = dep_ids_medulla, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "BP", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gobp_medulla, showCategory = 10) +
+    ggtitle("Top enriched GO BPs in the medulla") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "FigureS3D_compare_gobp_medulla.pdf", units = "px",
+       width = 1500, height = 1800)
+
+## go mf
+compare_gomf_medulla = compareCluster(geneClusters = dep_ids_medulla, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "MF", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gomf_medulla, showCategory = 10) +
+    ggtitle("Top enriched GO MFs in the medulla") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "FigureS3D_compare_gomf_medulla.pdf", units = "px",
+       width = 1500, height = 1800)
+
+## go cc
+compare_gocc_medulla = compareCluster(geneClusters = dep_ids_medulla, fun = enrichGO,
+                                   OrgDb = org.Hs.eg.db,
+                                   ont = "CC", keyType = "UNIPROT", 
+                                   pvalueCutoff = p_thres)
+dotplot(compare_gocc_medulla, showCategory = 10) +
+    ggtitle("Top enriched GO CCs in the medulla") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "FigureS3D_compare_gocc_medulla.pdf", units = "px",
+       width = 1500, height = 1800)
+
+## kegg
+compare_kegg_medulla = compareCluster(geneClusters = dep_ids_medulla, fun = enrichKEGG,
+                                     organism = 'hsa',
+                                     keyType = "uniprot", pvalueCutoff = p_thres)
+dotplot(compare_kegg_medulla, showCategory = 3) +
+    ggtitle("Top enriched KEGG pathways in the medulla") +
+    theme_few() +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+ggsave(filename = "FigureS3D_compare_kegg_medulla.pdf", units = "px",
+       width = 1500, height = 1800)
+```
+
+### check the number in parentheses on the plots
+
+```{r}
+select(org.Hs.eg.db, dep_ids_cortex$PD, "GO", "UNIPROT") %>% 
+    as.data.frame %>% .[which(.$ONTOLOGY == "BP"), ] %>%
+    extract2("UNIPROT") %>% unique %>% length
+
+select(org.Hs.eg.db, dep_ids_cortex$FP, "GO", "UNIPROT") %>% 
+    as.data.frame %>% .[which(.$ONTOLOGY == "BP"), ] %>%
+    extract2("UNIPROT") %>% unique %>% length
+```

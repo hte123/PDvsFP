@@ -1,0 +1,332 @@
+---
+title: "20220913_FPvsPD_hte_TMT10"
+author: "Tianen He"
+date: "2022/9/13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(xlsx, VennDiagram, tidyr, stringr, magrittr, ggplot2, pheatmap,
+               ggsignif, ggsci, ggthemes, viridis, ggvenn, ggVennDiagram)
+
+colors = pal_jco()(10)
+hcolors = pal_simpsons()(16)
+
+pd1 = "#1e88e5"
+pd2 = "#bbdefb"
+
+fp1 = "#ffb300"
+fp2 = "#ffecb3"
+
+root = "D:/hetianen/Documents/Guomics/FPvsPD paper 2.0/PD3.0/"
+```
+
+# Input files
+
+## PD without contaminants
+
+```{r}
+pd_protein = read.csv("./TMT10_PD3/F20200302gaohh_PCT2G_HCC_TMT10_chimerys_intensity_nocontam_hte220912_Proteins.txt", sep = "\t")
+pd_peptide = read.csv("./TMT10_PD3/F20200302gaohh_PCT2G_HCC_TMT10_chimerys_intensity_nocontam_hte220912_PeptideGroups.txt", sep = "\t")
+```
+
+## FP with contaminants
+
+```{r}
+fp_protein_tmt = read.csv("./TMT10_FP18/tmt-report/abundance_protein_None.tsv", sep = "\t")
+fp_peptide_tmt = read.csv("./TMT10_FP18/tmt-report/abundance_peptide_None.tsv", sep = "\t")
+```
+
+## contaminant
+
+```{r}
+contaminant_map = read.csv("./uniprot_contaminant_maps.txt", sep = "\t")
+contaminant_entry = contaminant_map$Entry
+
+channel_num = 10
+```
+
+# PD
+
+## protein
+
+```{r}
+# colnames(pd_protein)
+pd_protein_abundance = pd_protein[,30:39] # 10 samples
+colnames(pd_protein_abundance)
+```
+
+### Proteins with an abundance of NA in all 10 channels are considered as unquantified in PD
+
+```{r}
+# proteins with 10 NA are removed
+pd_protein_abundance_quantified = pd_protein_abundance %>% 
+  magrittr::extract(rowSums(is.na(.)) != channel_num, )
+
+pd_protein_abundance_quantified_ids = pd_protein %>% 
+  magrittr::extract(rowSums(is.na(pd_protein_abundance)) != channel_num, "Accession")
+rownames(pd_protein_abundance_quantified) = pd_protein_abundance_quantified_ids
+```
+
+### calculate missing rate
+
+```{r}
+# remove the completely not quantified proteins
+pd_protein_num_quantified = dim(pd_protein_abundance_quantified)[1]
+pd_na_count_quantified = length(pd_protein_abundance_quantified[pd_protein_abundance_quantified==0]) # include NAs and zeros
+pd_missing_rate_quantified = pd_na_count_quantified/(pd_protein_num_quantified * channel_num)
+pd_missing_rate_quantified
+
+pd_protein_abundance_quantified = log2(pd_protein_abundance_quantified)
+```
+
+## peptide
+
+```{r}
+# colnames(pd_peptide)
+pd_peptide_abundance = pd_peptide[,16:25]
+colnames(pd_peptide_abundance)
+```
+
+### calculate quantified
+
+```{r}
+# proteins with 10 NAs are removed
+pd_peptide_abundance_quantified = pd_peptide_abundance %>% 
+    extract(rowSums(is.na(.)) != channel_num, )
+```
+
+# FP
+
+## protein 
+
+### tmt-report (abundance) (remove contaminants) 
+
+```{r}
+# remove contaminants
+fp_protein_tmt_real = fp_protein_tmt[!(fp_protein_tmt$Index %in% contaminant_entry), ]
+fp_protein_num_tmt_real = dim(fp_protein_tmt_real)[1]
+
+# extract abundance    
+# colnames(fp_protein_tmt_real)
+fp_protein_abundance_tmt_real = fp_protein_tmt_real[, 6:15] 
+colnames(fp_protein_abundance_tmt_real)
+
+rownames(fp_protein_abundance_tmt_real) = fp_protein_tmt_real$Index
+```
+
+### calculate missing rate
+
+```{r}
+# tmt-report  (after removal of contaminants)
+fp_na_count_tmt_real = length(fp_protein_abundance_tmt_real[fp_protein_abundance_tmt_real==0]) # include NAs and zeros
+fp_missing_rate_tmt_real = fp_na_count_tmt_real/(fp_protein_num_tmt_real * channel_num)
+fp_missing_rate_tmt_real
+```
+
+## peptide
+
+### tmt-report (abundance) (remove contaminants)
+
+```{r}
+fp_peptide_tmt_real = fp_peptide_tmt[!(fp_peptide_tmt$ProteinID %in% contaminant_entry), ]
+fp_peptide_num_tmt_real = dim(fp_peptide_tmt_real)[1]
+```
+
+# Sort rows, rename columns, save log2 abundance to files
+
+```{r}
+colnames(fp_protein_abundance_tmt_real)
+colnames(fp_protein_abundance_tmt_real) = colnames(fp_protein_abundance_tmt_real) %>% 
+  str_replace(., "X", "") %>% str_replace(., "131N", "131")
+colnames(fp_protein_abundance_tmt_real)
+colnames(pd_protein_abundance_quantified) = colnames(fp_protein_abundance_tmt_real)
+
+# sort by accession
+pd_sorted = pd_protein_abundance_quantified[order(rownames(pd_protein_abundance_quantified)), ]
+fp_sorted = fp_protein_abundance_tmt_real[order(rownames(fp_protein_abundance_tmt_real)), ]
+
+# write.csv(pd_sorted, file = paste0(root, "PD_abundance[log2]_tmt10.csv"), quote = FALSE)
+# write.csv(fp_sorted, file = paste0(root, "FP_abundance[log2]_tmt10.csv"), quote = FALSE)
+```
+
+# Overlap of proteins quantified by PD and FP
+
+```{r}
+pd_accession = rownames(pd_sorted)
+fp_accession = rownames(fp_sorted)
+
+both_accession = intersect(pd_accession, fp_accession)
+
+venn = venn.diagram(list("PD" = pd_accession, "FP" = fp_accession), 
+             filename = NULL,
+             imagetype = "svg",
+             height = 800, width = 800, 
+             alpha = 0.5, lwd = 1, cex = 1, 
+             cat.cex = 0.8, margin = 0.1, cat.dist = 0.07,
+             ext.text = TRUE, ext.percent = c(0.2, 0.2, 0.2),
+             fill = c(pd1, fp1),
+             # cat.pos = c(120, 240),
+             # ext.length = 0.85
+             )
+ggsave(venn, path = root, filename = "FigureS2A_protein_overlap_tmt10.pdf", units = "px",
+       width = 600, height = 600)
+
+```
+
+## comparison of abundance between overlapped and non-overlapped proteins (PD and FP merged)
+
+PD and FP merged to one plot
+
+```{r}
+# data1, data2: protein matrix, include only abundances/ratios
+# both_accession: accessions of overlapped proteins
+# ylabel: eg. abundance, intensity, log2 abundance
+compare_overlap_nonoverlap_merged = function (data1, data2, both_accession, 
+                                              device = "pdf", ylabel) {
+    
+    # preprocess data
+    num_channels = dim(data1)[2]
+    data1$software = rep("PD", dim(data1)[1])
+    data1$overlap = rep("unique", dim(data1)[1])
+    data1[which(rownames(data1) %in% both_accession), ]$overlap = "overlapping"
+    data1$overlap = as.factor(data1$overlap)
+    
+    data2$software = rep("FP", dim(data2)[1])
+    data2$overlap = rep("unique", dim(data2)[1])
+    data2[which(rownames(data2) %in% both_accession), ]$overlap = "overlapping"
+    data2$overlap = as.factor(data2$overlap)
+    
+    data = rbind(data1, data2)
+    data_longer = pivot_longer(data, cols = c(1:num_channels), names_to = "channel")
+    data_longer$facet = str_c(data_longer$software, data_longer$overlap, sep = " ")
+
+    # one violin plot for each batch
+    p_template_violin = ggplot(data_longer, aes(x=facet, y=value)) +
+        geom_violin(aes(fill=facet)) +
+        geom_signif(comparisons = list(c("PD overlapping", "PD unique"),
+                                       c("FP overlapping", "FP unique")),
+                    # y_position = 32,
+                    test = wilcox.test, textsize = 3, map_signif_level = TRUE) +
+        ylab(ylabel) + xlab("") +
+        theme_few() +
+        # scale_fill_simpsons() +
+        scale_fill_manual(values=c(fp1, fp2, pd1, pd2)) +
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+              legend.title = element_blank())
+    
+    return(p_template_violin)
+}
+```
+
+```{r}
+p_compare_batch_violin = compare_overlap_nonoverlap_merged(
+    pd_sorted, fp_sorted, 
+    both_accession, ylabel = "Log2 (Protein abundance)")
+ggsave(file = paste0(root, "FigureS2C_protein_overlap_compare_batch_violin_PDandFP_tmt10.pdf"), 
+       plot = p_compare_batch_violin, width = 1600, height = 1000, units = "px")
+```
+
+# Correlation coefficients
+
+## correlation of log2 abundances of each sample (10 channels)
+
+```{r}
+# pd_ratio_scaled = scale(pd_sorted, scale = FALSE) # log2 abundance
+# fp_ratio_scaled = scale(fp_sorted, scale = FALSE)
+# pd_ratio_scaled = t(scale(t(pd_sorted))) # log2 abundance
+# fp_ratio_scaled = t(scale(t(fp_sorted)))
+pd_ratio_scaled = pd_sorted
+fp_ratio_scaled = fp_sorted
+
+# proteins identified in common
+pd_ratio_both = pd_ratio_scaled[sort(both_accession), ] %>% as.data.frame()
+fp_ratio_both = fp_ratio_scaled[sort(both_accession), ] %>% as.data.frame()
+
+colnames(pd_ratio_both) = paste("PD", colnames(pd_ratio_both), sep = "_")
+colnames(fp_ratio_both) = paste("FP", colnames(fp_ratio_both), sep = "_")
+
+cor_matrix = cor(pd_ratio_both, fp_ratio_both, use = "pairwise.complete.obs",
+                 method = "spearman")
+
+pheatmap(cor_matrix, 
+         cluster_cols = F, cluster_rows = F,
+         filename = paste0(root, "protein_cor_matrix_tmt10.pdf"), 
+         # main = "Pearson Correlation Matrix",
+         color = cividis(100, direction = 1),
+         width = 4.5, height = 4, fontsize = 8,
+         # show_colnames = F, show_rownames = F,
+         # fontsize_row = 6, fontsize_col = 6,
+         # angle_col = "315"
+         )
+
+# extract diagonal
+cor_self = diag(cor_matrix)
+cor_self_median = median(cor_self)
+cor_self_median
+
+hist_plot = ggplot(data.frame(cor_self), aes(x = cor_self, y = ..count..)) +
+    geom_histogram(bins = 10, fill = colors[10], color = "white") +
+    # ggtitle("Distribution of Pearson Correlation Coefficient") + 
+    xlab("Spearman's correlation coefficient") +
+    ylab("Count of samples") +
+    # ylim(0, 20) +
+    theme_few() +
+    geom_vline(xintercept = cor_self_median, color = colors[2], size = 1, linetype = 1)
+ggsave(plot = hist_plot, 
+       file = paste0(root, "FigureS2E_correlation_coefficient_distribution_tmt10_samples.pdf"),
+       width = 1200, height = 1000, units = "px")
+```
+
+## correlation of log2 abundances of each protein
+
+```{r}
+# transpose
+pd_ratio_t = t(pd_sorted) %>% as.data.frame() 
+fp_ratio_t = t(fp_sorted) %>% as.data.frame() 
+
+# extract proteins in common
+pd_ratio_both_t = pd_ratio_t[, sort(both_accession)] %>% as.data.frame()
+fp_ratio_both_t = fp_ratio_t[, sort(both_accession)] %>% as.data.frame()
+
+# colnames(pd_ratio_both_t) = paste("PD", colnames(pd_ratio_both_t), sep = "_")
+# colnames(fp_ratio_both_t) = paste("FP", colnames(fp_ratio_both_t), sep = "_")
+
+cor_self_t = list()
+for (prot in both_accession) {
+    cor_t = cor(pd_ratio_both_t[[prot]], fp_ratio_both_t[[prot]], method = "spearman",
+                use = "pairwise.complete.obs")
+    cor_self_t[[prot]] = cor_t
+}
+cor_self_t = unlist(cor_self_t)
+
+summary(cor_self_t)
+cor_self_median_t = median(cor_self_t)
+cor_self_median_t
+
+hist_plot_t = ggplot(data.frame(cor_self_t), aes(x = cor_self_t, y = ..count..)) +
+    geom_histogram(bins = 30, fill = colors[10], color = "white") +
+    # ggtitle("Distribution of Pearson Correlation Coefficient") + 
+    xlab("Spearman's correlation coefficient") +
+    ylab("Count of proteins") +
+    # ylim(0, 20) +
+    theme_few() +
+    geom_vline(xintercept = cor_self_median_t, color = colors[2], size = 1, linetype = 1)
+ggsave(plot = hist_plot_t, file = paste0(
+    root, "FigureS2D_correlation_coefficient_distribution_tmt10_proteins.pdf"),
+       width = 1200, height = 1000, units = "px")
+hist_plot_t
+```
+
+## correlation of protein matrix as a whole
+
+```{r}
+pd_ratio_both_vector = unlist(pd_ratio_both)
+fp_ratio_both_vector = unlist(fp_ratio_both)
+
+cor = cor(pd_ratio_both_vector, fp_ratio_both_vector, use = "pairwise.complete.obs",
+          method = "spearman")
+cor.test(pd_ratio_both_vector, fp_ratio_both_vector,
+         alternative = "two.sided", method = "spearman")
+```

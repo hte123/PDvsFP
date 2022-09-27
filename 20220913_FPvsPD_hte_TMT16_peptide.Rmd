@@ -1,0 +1,119 @@
+---
+title: "20220913_FPvsPD_hte_TMT16_peptide"
+author: "Tianen He"
+date: "2022/9/13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(xlsx, magrittr)
+```
+
+# Input files
+
+## PD without contaminants
+
+```{r}
+pd_protein = read.csv("./TMT16_PD3/TMT16plex_chimerys_intensity_nocontam_220914_Proteins.txt", sep = "\t")
+pd_peptide = read.csv("./TMT16_PD3/TMT16plex_chimerys_intensity_nocontam_220914_PeptideGroups.txt", sep = "\t")
+```
+
+## FP with contaminants
+
+```{r}
+fp_protein_tmt = read.csv("./TMT16_FP18/tmt-report/abundance_protein_None.tsv", sep = "\t")
+fp_peptide_tmt = read.csv("./TMT16_FP18//tmt-report/abundance_peptide_None.tsv", sep = "\t")
+```
+
+## contaminant
+
+```{r}
+contaminant_map = read.csv("./uniprot_contaminant_maps.txt", sep = "\t")
+contaminant_entry = contaminant_map$Entry
+
+channel_num = 4*15
+```
+
+# PD
+
+## protein
+
+```{r}
+colnames(pd_protein)
+pd_protein_abundance = pd_protein[,c(96:110,112:126,128:142,144:158)-65] # 4*15 samples, without pool
+colnames(pd_protein_abundance)
+```
+
+### Proteins with an abundance of NA in all 15*4 channels are considered as unquantified in PD
+
+```{r}
+# proteins with 15*4 NA are removed
+pd_protein_abundance_quantified = pd_protein_abundance %>% 
+    magrittr::extract(rowSums(is.na(.)) != channel_num, )
+```
+
+### calculate missing rate
+
+```{r}
+# remove the completely not quantified proteins
+pd_protein_num_quantified = dim(pd_protein_abundance_quantified)[1]
+pd_na_count_quantified = length(pd_protein_abundance_quantified[pd_protein_abundance_quantified==0]) # include NAs and zeros
+pd_missing_rate_quantified = pd_na_count_quantified/(pd_protein_num_quantified * channel_num)
+pd_missing_rate_quantified
+```
+
+## peptide
+
+```{r}
+# colnames(pd_peptide)
+pd_peptide_abundance = pd_peptide[,c(96:110,112:126,128:142,144:158)-79] # 4*15 samples, without pool
+colnames(pd_peptide_abundance)
+
+# proteins with 15*4 NA are removed
+pd_peptide_abundance_quantified = pd_peptide_abundance %>% 
+    extract(rowSums(is.na(.)) != channel_num, )
+```
+
+# FP
+
+## protein
+
+### tmt-report (abundance) (remove contaminants) (4 batches)
+
+```{r}
+# remove contaminants
+fp_protein_tmt_real = fp_protein_tmt[!(fp_protein_tmt$Index %in% contaminant_entry), ]
+fp_protein_num_tmt_real = dim(fp_protein_tmt_real)[1]
+
+# extract abundance    
+fp_protein_abundance_tmt_real = fp_protein_tmt_real[, 6:65] # 4 batches
+colnames(fp_protein_abundance_tmt_real)
+```
+
+### calculate quantified (all are quantified)
+
+```{r}
+# proteins with 15*4 NA are removed
+tmp = fp_protein_abundance_tmt_real
+tmp[is.na(tmp)] = 0
+summary((apply(tmp, 1, sum))!=0)
+```
+
+### calculate missing rate
+
+```{r}
+# tmt-report  (after removal of contaminants)
+fp_na_count_tmt_real = length(fp_protein_abundance_tmt_real[fp_protein_abundance_tmt_real==0]) # include NAs and zeros
+fp_missing_rate_tmt_real = fp_na_count_tmt_real/(fp_protein_num_tmt_real * channel_num)
+fp_missing_rate_tmt_real
+```
+
+## peptide
+
+### tmt-report (abundance) (remove contaminants)
+
+```{r}
+fp_peptide_tmt_real = fp_peptide_tmt[!(fp_peptide_tmt$ProteinID %in% contaminant_entry), ]
+fp_peptide_num_tmt_real = dim(fp_peptide_tmt_real)[1]
+```
